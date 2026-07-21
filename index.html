@@ -409,8 +409,9 @@ canvas.sig-canvas{display:block;width:100%;touch-action:none;cursor:crosshair;ba
     </div>
     <div class="export-card" style="margin-top:12px">
       <div class="export-title">Download Inspection Package</div>
-      <div class="export-desc">Downloads both the CSV and a JSON sidecar (signatures + photos) for import to the office dashboard. Copy both files to your computer via USB.</div>
-      <button class="btn btn-primary" onclick="exportPackage()">Download Inspection Package</button>
+      <div class="export-desc">Tap the buttons in order. Save the CSV first, then tap again for the data file (signatures + photos). On iPad, downloading them one at a time prevents the save from failing.</div>
+      <button class="btn btn-primary" onclick="exportPackage()">1. Download CSV</button>
+      <button class="btn btn-primary" id="btn-download-json" onclick="downloadJSONSidecar()" style="display:none;margin-top:8px;background:#185fa5">2. Download Data File (JSON)</button>
     </div>
     <div class="export-card" style="background:var(--amber-light);border-color:var(--amber);margin-top:12px">
       <div class="export-title" style="color:var(--amber)">Generate Order to Correct</div>
@@ -1889,19 +1890,72 @@ function renderSavedList(){
   }).join('');
 }
 
+// ===== PHOTO COMPRESSION (for reliable iPad export) =====
+// Downscales a photo data-URL to a max dimension and re-encodes as JPEG.
+// This keeps the JSON sidecar small enough to avoid Safari's blob-URL quota.
+function resizeDataURL(dataURL, maxDim, quality){
+  return new Promise(function(resolve){
+    try{
+      var img=new Image();
+      img.onload=function(){
+        var w=img.width, h=img.height;
+        if(w>maxDim||h>maxDim){
+          if(w>=h){ h=Math.round(h*maxDim/w); w=maxDim; }
+          else    { w=Math.round(w*maxDim/h); h=maxDim; }
+        }
+        var c=document.createElement('canvas');
+        c.width=w; c.height=h;
+        c.getContext('2d').drawImage(img,0,0,w,h);
+        try{ resolve(c.toDataURL('image/jpeg', quality||0.7)); }
+        catch(e){ resolve(dataURL); } // fall back to original on any encode error
+      };
+      img.onerror=function(){ resolve(dataURL); };
+      img.src=dataURL;
+    }catch(e){ resolve(dataURL); }
+  });
+}
+// Returns a copy of the violations array with every photo compressed.
+// Originals in state.violations are left untouched.
+function compressAllPhotos(violations){
+  var jobs=[];
+  var out=violations.map(function(v){
+    var copy=Object.assign({},v);
+    copy.photos=(v.photos||[]).slice();
+    (v.photos||[]).forEach(function(p,idx){
+      jobs.push(resizeDataURL(p,1280,0.7).then(function(small){ copy.photos[idx]=small; }));
+    });
+    return copy;
+  });
+  return Promise.all(jobs).then(function(){ return out; });
+}
+
+// Step 1 of the package export: download the CSV, then reveal the JSON button.
+// iPad Safari can only present ONE "Save to Files" sheet at a time, so we never
+// fire both downloads together — the second one would hijack the first's save.
 function exportPackage() {
   const h = collectHeader();
   const baseName = ((h.address||'inspection').replace(/\s+/g,'_')) + '_' + (h.date||new Date().toISOString().split('T')[0]);
-
-  // 1. Download CSV
   exportCSV(baseName);
+  var jsonBtn = document.getElementById('btn-download-json');
+  if (jsonBtn) {
+    jsonBtn.style.display = 'block';
+    jsonBtn.dataset.baseName = baseName;
+  }
+  toast('CSV saved. Now tap "2. Download Data File".');
+}
 
-  // 2. Build and download JSON sidecar with signatures + photos
-  setTimeout(function() {
+// Step 2: compress photos, then download the JSON sidecar on its own tap.
+function downloadJSONSidecar() {
+  const h = collectHeader();
+  var btn = document.getElementById('btn-download-json');
+  var baseName = (btn && btn.dataset.baseName) ||
+    (((h.address||'inspection').replace(/\s+/g,'_')) + '_' + (h.date||new Date().toISOString().split('T')[0]));
+  toast('Preparing data file…');
+  compressAllPhotos(state.violations).then(function(violationsSmall){
     const sidecar = {
       baseName: baseName,
       header: h,
-      violations: state.violations, // full data including photos from memory
+      violations: violationsSmall, // photos compressed for size
       reinspection: {
         date: document.getElementById('ri-date').value,
         time: document.getElementById('ri-time').value,
@@ -1920,16 +1974,16 @@ function exportPackage() {
       },
       exportedAt: new Date().toISOString()
     };
-
     const blob = new Blob([JSON.stringify(sidecar)], {type:'application/json'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = baseName + '.json';
     a.click();
-    URL.revokeObjectURL(url);
-    toast('Package downloaded! Copy both files to your computer.');
-  }, 800);
+    // Give iOS time to hand the blob to the Files sheet before revoking.
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+    toast('Data file saved. Copy both files to your computer.');
+  });
 }
 function generateOTC(party) {
   var h = collectHeader();
